@@ -26,11 +26,11 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
 
-      - name: Save seen-articles list
+      - name: save seen-articles list
         run: |
           git config user.name "news-watch-bot"
           git config user.email "actions@github.com"
           git add seen.json
           git diff --staged --quiet || git commit -m "update seen list"
-          git pull --rebase origin main
+          git pull --no-rebase -X ours origin main
           git push
