@@ -32,4 +32,5 @@ jobs:
           git config user.email "actions@github.com"
           git add seen.json
           git diff --staged --quiet || git commit -m "update seen list"
+          git pull --rebase origin main
           git push
