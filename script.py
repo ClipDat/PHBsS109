@@ -61,6 +61,35 @@ KEYWORD_GROUPS = {
     "trump_geopolitics": {"a": ["trump"], "b": ["iran", "strike", "attack", "military", "sanctions", "israel", "china tariff"]},
 }
 
+# Stocks/ETFs that commonly react to each topic. This is a starting map, not a
+# prediction - edit freely. Direction depends on the actual news, which
+# keywords alone can't tell (e.g. "oil price" could be up OR down).
+IMPACT = {
+    "crypto": "COIN, MSTR, MARA, RIOT, IBIT",
+    "ai": "NVDA, AMD, MSFT, GOOGL, SMCI",
+    "big_tech": "AAPL, MSFT, GOOGL, AMZN, META, TSLA",
+    "oil_energy": "Producers: XOM, CVX, OXY | Hurt by high oil: DAL, UAL",
+    "fed_rates": "Banks: JPM, BAC | Rate-sensitive: QQQ, XHB (homebuilders)",
+    "market_moving": "Broad market: SPY, QQQ",
+    "geopolitics": "Defense: LMT, RTX, NOC | Oil: XOM, CVX | Gold: GLD",
+    "trump_crypto": "COIN, MSTR, DJT",
+    "trump_geopolitics": "Defense: LMT, RTX | Oil: XOM, CVX | Gold: GLD",
+}
+
+POSITIVE_WORDS = ["surge", "jump", "rally", "soar", "beat", "record high", "approve", "gain", "rise", "rises"]
+NEGATIVE_WORDS = ["plunge", "crash", "drop", "fall", "falls", "miss", "ban", "lawsuit", "hack", "sell-off", "slump"]
+
+
+def headline_tone(text):
+    """Very rough tone guess from headline words. Often wrong - just a hint."""
+    t = text.lower()
+    pos = sum(w in t for w in POSITIVE_WORDS)
+    neg = sum(w in t for w in NEGATIVE_WORDS)
+    if pos > neg:
+        return "positive-sounding"
+    if neg > pos:
+        return "negative-sounding"
+    return "unclear"
 
 def matches(text, group_def):
     text_l = text.lower()
@@ -135,7 +164,17 @@ def main():
                     break
 
             new_seen.add(link)
-
+            body = (
+                f"{title}\n"
+                f"Tone: {headline_tone(full_text)}\n"
+                f"May affect: {IMPACT.get(group_name, 'n/a')}\n"
+                f"(Not advice - verify before acting)"
+            )
+            send_notification(
+                title=f"🚨 {group_name.replace('_', ' ').title()}",
+                message=body,
+                url=link,
+            )
     save_seen(new_seen)
 
 
