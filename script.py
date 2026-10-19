@@ -1,10 +1,10 @@
 """
 News watcher for crypto/market-moving headlines.
-Checks a set of RSS feeds for keyword combinations and pushes
-a notification to your phone via ntfy.sh when something matches.
+Sends ONE digest notification per run with all matched headlines (with links)
+and which stocks may go up / down / be affected. Uses GitHub Models (free)
+for the analysis, with a simple ticker-map fallback if the AI call fails.
 
-This does NOT predict the future. It catches news within minutes
-of it being published. Always verify before trading on an alert.
+This does NOT predict the future and is not financial advice.
 """
 
 import feedparser
@@ -13,12 +13,13 @@ import json
 import os
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "changeme-topic")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 SEEN_FILE = "seen.json"
 
-# Add/remove RSS feeds here freely - any standard RSS/Atom feed works.
-# Feeds do occasionally go stale or change URLs over time - if one breaks,
-# the script just skips it and keeps going (see the try/except below), so
-# it's safe to leave broken ones in until you notice and swap them out.
+AI_MODEL = "openai/gpt-4o-mini"   # any model from the GitHub Models catalog
+MAX_HEADLINES = 10                # per digest; extras roll into the next run
+MAX_MESSAGE_CHARS = 3600          # ntfy messages are limited to ~4KB
+
 FEEDS = [
     # crypto-specific
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -27,26 +28,21 @@ FEEDS = [
     "https://decrypt.co/feed",
     "https://bitcoinmagazine.com/feed",
     # general business / markets
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC top news
-    "https://www.cnbc.com/id/10001147/device/rss/rss.html",   # CNBC markets
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "https://www.cnbc.com/id/10001147/device/rss/rss.html",
     "https://feeds.marketwatch.com/marketwatch/topstories/",
     "https://finance.yahoo.com/news/rssindex",
     # tech / AI
-    "https://www.cnbc.com/id/19854910/device/rss/rss.html",   # CNBC tech
+    "https://www.cnbc.com/id/19854910/device/rss/rss.html",
     "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://venturebeat.com/category/ai/feed/",
     # oil / energy
     "https://oilprice.com/rss/main",
-    # world news (for geopolitics that move markets)
+    # world news
     "https://feeds.bbci.co.uk/news/world/rss.xml",
 ]
 
-# Groups with a single keyword list fire when 1+ keyword hits (broad topic watch).
-# Groups with two keyword lists ("a" and "b") require one hit from EACH list -
-# use that style when a topic is only interesting combined with another (e.g.
-# Trump + crypto, rather than either alone flooding you with noise).
 KEYWORD_GROUPS = {
-    # broad topic watches - any single mention triggers these
     "crypto": ["crypto", "bitcoin", "ethereum", "coin", "token", "stablecoin", "memecoin", "defi", "sec crypto", "solana", "xrp"],
     "ai": ["openai", "chatgpt", "anthropic", "claude ai", "artificial intelligence", " ai model", "nvidia", "gpu chip", "deepseek", "gemini"],
     "big_tech": ["apple", "google", "microsoft", "amazon", "meta platforms", "tesla", "nvidia", "alphabet"],
@@ -54,49 +50,28 @@ KEYWORD_GROUPS = {
     "fed_rates": ["federal reserve", "interest rate", "fed chair", "rate cut", "rate hike", "powell", "fomc"],
     "market_moving": ["earnings beat", "earnings miss", "stock plunge", "stock surge", "market sell-off", "recession", "inflation report", "jobs report", "gdp growth", "bankruptcy", "ipo"],
     "geopolitics": ["sanctions", "military strike", "invasion", "ceasefire", "trade war", "tariffs", "war"],
-
-    # narrower combos - need one hit from EACH list to fire, so a common name
-    # like "trump" alone (constant in the news) doesn't spam you
     "trump_crypto": {"a": ["trump"], "b": ["coin", "token", "crypto", "bitcoin", "memecoin"]},
     "trump_geopolitics": {"a": ["trump"], "b": ["iran", "strike", "attack", "military", "sanctions", "israel", "china tariff"]},
 }
 
-# Stocks/ETFs that commonly react to each topic. This is a starting map, not a
-# prediction - edit freely. Direction depends on the actual news, which
-# keywords alone can't tell (e.g. "oil price" could be up OR down).
+# Fallback map used only when the AI call fails. Direction is unknown here.
 IMPACT = {
     "crypto": "COIN, MSTR, MARA, RIOT, IBIT",
     "ai": "NVDA, AMD, MSFT, GOOGL, SMCI",
     "big_tech": "AAPL, MSFT, GOOGL, AMZN, META, TSLA",
-    "oil_energy": "Producers: XOM, CVX, OXY | Hurt by high oil: DAL, UAL",
-    "fed_rates": "Banks: JPM, BAC | Rate-sensitive: QQQ, XHB (homebuilders)",
-    "market_moving": "Broad market: SPY, QQQ",
-    "geopolitics": "Defense: LMT, RTX, NOC | Oil: XOM, CVX | Gold: GLD",
+    "oil_energy": "XOM, CVX, OXY (producers); DAL, UAL (fuel costs)",
+    "fed_rates": "JPM, BAC, QQQ, XHB",
+    "market_moving": "SPY, QQQ",
+    "geopolitics": "LMT, RTX, NOC, XOM, CVX, GLD",
     "trump_crypto": "COIN, MSTR, DJT",
-    "trump_geopolitics": "Defense: LMT, RTX | Oil: XOM, CVX | Gold: GLD",
+    "trump_geopolitics": "LMT, RTX, XOM, CVX, GLD",
 }
 
-POSITIVE_WORDS = ["surge", "jump", "rally", "soar", "beat", "record high", "approve", "gain", "rise", "rises"]
-NEGATIVE_WORDS = ["plunge", "crash", "drop", "fall", "falls", "miss", "ban", "lawsuit", "hack", "sell-off", "slump"]
-
-
-def headline_tone(text):
-    """Very rough tone guess from headline words. Often wrong - just a hint."""
-    t = text.lower()
-    pos = sum(w in t for w in POSITIVE_WORDS)
-    neg = sum(w in t for w in NEGATIVE_WORDS)
-    if pos > neg:
-        return "positive-sounding"
-    if neg > pos:
-        return "negative-sounding"
-    return "unclear"
 
 def matches(text, group_def):
     text_l = text.lower()
     if isinstance(group_def, dict):
-        # combo group: need 1+ hit from list "a" AND 1+ hit from list "b"
         return any(kw in text_l for kw in group_def["a"]) and any(kw in text_l for kw in group_def["b"])
-    # simple group: need just 1 hit from the list
     return any(kw in text_l for kw in group_def)
 
 
@@ -111,19 +86,89 @@ def load_seen():
 
 
 def save_seen(seen):
-    # cap growth so the file doesn't balloon forever
     with open(SEEN_FILE, "w") as f:
         json.dump(list(seen)[-500:], f)
 
 
-def send_notification(title, message, url):
+def analyze_batch(hits):
+    """One AI call for the whole digest. Returns a dict or None."""
+    if not GITHUB_TOKEN:
+        return None
+    lines = [
+        f"{i}. {h['title']} - {h['summary'][:150]}"
+        for i, h in enumerate(hits, 1)
+    ]
+    prompt = (
+        "You help a retail trader scan news. Based ONLY on these headlines, reply "
+        "with ONLY JSON, no other text, in this shape: "
+        '{"up": [{"ticker": "XOM", "why": "short reason"}], '
+        '"down": [{"ticker": "DAL", "why": "short reason"}], '
+        '"affected": [{"ticker": "COIN", "why": "short reason"}]}. '
+        '"up" = stocks likely to rise, "down" = likely to fall, "affected" = '
+        "likely to move but direction unclear. Max 5 per list, only real tickers, "
+        "empty lists if nothing is clear. Be conservative.\n\n" + "\n".join(lines)
+    )
+    try:
+        r = requests.post(
+            "https://models.github.ai/inference/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": AI_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 700,
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"]
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"AI analysis failed: {e}")
+        return None
+
+
+def build_message(hits, analysis):
+    parts = [f"{i}. {h['title']}\n{h['link']}" for i, h in enumerate(hits, 1)]
+    text = "\n\n".join(parts)
+
+    if analysis:
+        sections = [
+            ("📈 May go up", "up"),
+            ("📉 May go down", "down"),
+            ("↔️ Affected (direction unclear)", "affected"),
+        ]
+        for label, key in sections:
+            items = [x for x in (analysis.get(key) or []) if isinstance(x, dict)]
+            if items:
+                text += f"\n\n{label}\n" + "\n".join(
+                    f"{x.get('ticker', '?')} - {x.get('why', '')}" for x in items[:5]
+                )
+    else:
+        groups = []
+        for h in hits:
+            if h["group"] not in groups:
+                groups.append(h["group"])
+        text += "\n\n↔️ Possibly affected (direction unknown)\n" + "\n".join(
+            f"{g.replace('_', ' ').title()}: {IMPACT.get(g, 'n/a')}" for g in groups
+        )
+
+    text = text[:MAX_MESSAGE_CHARS]
+    return text + "\n\nNot advice - verify before acting"
+
+
+def send_notification(title, message):
     try:
         requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=message.encode("utf-8"),
             headers={
                 "Title": title.encode("utf-8"),
-                "Click": url,
                 "Priority": "high",
                 "Tags": "rotating_light",
             },
@@ -136,6 +181,8 @@ def send_notification(title, message, url):
 def main():
     seen = load_seen()
     new_seen = set(seen)
+    hits = []
+    hit_links = set()
 
     for feed_url in FEEDS:
         try:
@@ -153,28 +200,28 @@ def main():
             summary = entry.get("summary", "")
             full_text = f"{title} {summary}"
 
+            matched_group = None
             for group_name, keywords in KEYWORD_GROUPS.items():
                 if matches(full_text, keywords):
-                    send_notification(
-                        title=f"🚨 {group_name.replace('_', ' ').title()}",
-                        message=title,
-                        url=link,
-                    )
-                    print(f"Notified [{group_name}]: {title}")
+                    matched_group = group_name
                     break
 
-            new_seen.add(link)
-            body = (
-                f"{title}\n"
-                f"Tone: {headline_tone(full_text)}\n"
-                f"May affect: {IMPACT.get(group_name, 'n/a')}\n"
-                f"(Not advice - verify before acting)"
-            )
-            send_notification(
-                title=f"🚨 {group_name.replace('_', ' ').title()}",
-                message=body,
-                url=link,
-            )
+            if matched_group:
+                if link not in hit_links:
+                    hits.append({"title": title, "summary": summary, "link": link, "group": matched_group})
+                    hit_links.add(link)
+            else:
+                new_seen.add(link)
+
+    batch = hits[:MAX_HEADLINES]  # overflow stays unseen and goes out next run
+    if batch:
+        analysis = analyze_batch(batch)
+        message = build_message(batch, analysis)
+        send_notification(f"🚨 Market digest ({len(batch)} headlines)", message)
+        print(f"Sent digest with {len(batch)} headlines (AI: {'yes' if analysis else 'fallback'})")
+        for h in batch:
+            new_seen.add(h["link"])
+
     save_seen(new_seen)
 
 
