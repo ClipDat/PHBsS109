@@ -7,7 +7,8 @@ on:
 
 permissions:
   contents: write
-
+  models: read
+  
 jobs:
   watch:
     runs-on: ubuntu-latest
@@ -20,11 +21,12 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-
+        
       - name: Run watcher
         run: python script.py
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: save seen-articles list
         run: |
