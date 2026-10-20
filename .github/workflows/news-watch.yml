@@ -27,12 +27,17 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+          
+      - name: Run memecoin scanner
+        run: python memecoin_scan.py
+        continue-on-error: true
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       - name: save seen-articles list
         run: |
           git config user.name "news-watch-bot"
           git config user.email "actions@github.com"
-          git add seen.json
+          git add seen.json seen_coins.json
           git diff --staged --quiet || git commit -m "update seen list"
           git pull --no-rebase -X ours origin main
           git push
