@@ -142,8 +142,13 @@ def fetch_quotes(tickers, have=None):
 
 
 # ---------------------------------------------------------------- AI
+AI_ERROR = ""
+
+
 def ask_ai(hits, quotes):
+    global AI_ERROR
     if not GITHUB_TOKEN:
+        AI_ERROR = "no GITHUB_TOKEN passed in - the workflow file is the old one (needs env GITHUB_TOKEN)"
         return None
     today = datetime.now(timezone.utc).strftime("%A %Y-%m-%d")
     heads = "\n".join(f"{i}. [{h['group']}] {h['title']} -- {h['summary'][:220]}" for i, h in enumerate(hits, 1))
@@ -170,12 +175,16 @@ def ask_ai(hits, quotes):
                                    "Content-Type": "application/json"},
                           json={"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}],
                                 "temperature": 0.2, "max_tokens": 1400}, timeout=60)
-        r.raise_for_status()
+        if r.status_code != 200:
+            AI_ERROR = f"HTTP {r.status_code}: {r.text[:160]}"
+            print("AI analysis failed:", AI_ERROR)
+            return None
         text = r.json()["choices"][0]["message"]["content"]
         text = text[text.index("{"): text.rindex("}") + 1]
         return clean_analysis(json.loads(text), len(hits))
     except Exception as e:
-        print(f"AI analysis failed: {e}")
+        AI_ERROR = f"{type(e).__name__}: {str(e)[:160]}"
+        print(f"AI analysis failed: {AI_ERROR}")
         return None
 
 
@@ -290,6 +299,8 @@ def build_message(hits, analysis, quotes):
         text += f"\n\n+{quiet} headline(s) judged not market-moving."
     if analysis and analysis["overall"]:
         text += f"\n\nOverall: {analysis['overall']}"
+    if not analysis and AI_ERROR:
+        text += f"\n\nAI error: {AI_ERROR}"
     text += f"\n\n{scorecard_line()}\nAI guess from headlines only, not advice. Check the price before acting."
     return text[:3700]
 
