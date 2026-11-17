@@ -19,6 +19,7 @@ import html
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 import feedparser
@@ -27,7 +28,7 @@ import requests
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "changeme-topic")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")      # optional, free from aistudio.google.com/apikey
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"]   # tried in order
+GEMINI_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"]   # tried first; the script also asks Google which models exist
 AI_MODEL = "openai/gpt-4o-mini"          # any model from the GitHub Models catalog
 SEEN_FILE = "seen.json"
 CALLS_FILE = "calls_log.json"
@@ -199,14 +200,34 @@ def ask_ai(hits, quotes):
 
     providers = []
     if GEMINI_API_KEY:
-        for gm in GEMINI_MODELS:
-            cfg = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 1800}
-            if gm.startswith("gemini-2.5"):
-                cfg["thinkingConfig"] = {"thinkingBudget": 0}      # no 'thinking' = fast answer
-            providers.append(("gemini", lambda gm=gm, cfg=cfg: requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent",
-                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}, timeout=40)))
+        def gemini_models():
+            names = list(GEMINI_MODELS)
+            try:
+                r = requests.get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                                 headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=15)
+                found = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+                         if "generateContent" in m.get("supportedGenerationMethods", [])
+                         and "flash" in m["name"] and not re.search(r"image|tts|live|audio|embed|vision|thinking-exp|preview-\d", m["name"])]
+                names += sorted((n for n in found if n not in names), reverse=True)[:4]
+            except Exception:
+                pass
+            return names
+
+        def gemini_call(gm):
+            cfg = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 2500}
+            resp = None
+            for attempt_no in range(3):                      # Google says 'high demand' now and then: wait and retry
+                resp = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent",
+                    headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                    json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}, timeout=60)
+                if resp.status_code not in (429, 500, 502, 503, 504):
+                    break
+                time.sleep(6 * (attempt_no + 1))
+            return resp
+
+        for gm in gemini_models():
+            providers.append(("gemini", lambda gm=gm: gemini_call(gm)))
     if GITHUB_TOKEN:
         providers.append(("github", lambda: requests.post(
             "https://models.github.ai/inference/chat/completions",
