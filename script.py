@@ -26,6 +26,8 @@ import requests
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "changeme-topic")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")      # optional, free from aistudio.google.com/apikey
+GEMINI_MODEL = "gemini-flash-latest"
 AI_MODEL = "openai/gpt-4o-mini"          # any model from the GitHub Models catalog
 SEEN_FILE = "seen.json"
 CALLS_FILE = "calls_log.json"
@@ -147,8 +149,8 @@ AI_ERROR = ""
 
 def ask_ai(hits, quotes):
     global AI_ERROR
-    if not GITHUB_TOKEN:
-        AI_ERROR = "no GITHUB_TOKEN passed in - the workflow file is the old one (needs env GITHUB_TOKEN)"
+    if not GITHUB_TOKEN and not GEMINI_API_KEY:
+        AI_ERROR = "no AI key passed in - the workflow needs env GITHUB_TOKEN and/or GEMINI_API_KEY"
         return None
     today = datetime.now(timezone.utc).strftime("%A %Y-%m-%d")
     heads = "\n".join(f"{i}. [{h['group']}] {h['title']} -- {h['summary'][:220]}" for i, h in enumerate(hits, 1))
@@ -169,28 +171,52 @@ def ask_ai(hits, quotes):
         "Use confidence 'high' ONLY for hard, specific news (rate decisions, earnings numbers, sanctions, official actions). "
         "If the last-session change already moved a lot in the direction the news implies, say priced_in=yes."
     )
-    endpoints = ["https://models.github.ai/inference/chat/completions",
-                 "https://models.inference.ai.azure.com/chat/completions"]
-    models = [AI_MODEL, AI_MODEL.split("/")[-1]]
     errors = []
-    for url, model in zip(endpoints, models):
+
+    def parse(text):
+        text = text[text.index("{"): text.rindex("}") + 1]
+        return clean_analysis(json.loads(text), len(hits))
+
+    def attempt(name, fn):
+        resp = None
         try:
-            r = requests.post(url,
-                              headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/json",
-                                       "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
-                              json={"model": model, "messages": [{"role": "user", "content": prompt}],
-                                    "temperature": 0.2, "max_tokens": 1400}, timeout=60)
-            body = (r.text or "").strip()
-            if r.status_code != 200 or not body:
-                errors.append(f"{url.split('/')[2]} HTTP {r.status_code}: {body[:120] or '(empty reply)'}")
-                continue
-            text = r.json()["choices"][0]["message"]["content"]
-            text = text[text.index("{"): text.rindex("}") + 1]
-            AI_ERROR = ""
-            return clean_analysis(json.loads(text), len(hits))
+            resp = fn()
+            body = (resp.text or "").strip()
+            if resp.status_code != 200 or not body:
+                errors.append(f"{name} HTTP {resp.status_code}: {body[:120] or '(empty reply)'}")
+                return None
+            return parse(extract(name, resp))
         except Exception as e:
-            errors.append(f"{url.split('/')[2]} {type(e).__name__}: {str(e)[:100]} | reply: {(locals().get('r') and r.text or '')[:100]!r}")
-    AI_ERROR = " || ".join(errors)
+            shown = (resp.text or "")[:80] if resp is not None else ""
+            errors.append(f"{name} {type(e).__name__}: {str(e)[:90]} | reply: {shown!r}")
+            return None
+
+    def extract(name, resp):
+        d = resp.json()
+        if name == "gemini":
+            return d["candidates"][0]["content"]["parts"][0]["text"]
+        return d["choices"][0]["message"]["content"]
+
+    providers = []
+    if GEMINI_API_KEY:
+        providers.append(("gemini", lambda: requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}, timeout=60)))
+    if GITHUB_TOKEN:
+        providers.append(("github", lambda: requests.post(
+            "https://models.github.ai/inference/chat/completions",
+            headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json",
+                     "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
+            json={"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0.2, "max_tokens": 1400}, timeout=60)))
+    for name, fn in providers:
+        result = attempt(name, fn)
+        if result:
+            AI_ERROR = ""
+            return result
+    AI_ERROR = " || ".join(errors) or "no AI key available"
     print("AI analysis failed:", AI_ERROR)
     return None
 
