@@ -27,7 +27,7 @@ import requests
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "changeme-topic")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")      # optional, free from aistudio.google.com/apikey
-GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-latest"]   # tried in order
 AI_MODEL = "openai/gpt-4o-mini"          # any model from the GitHub Models catalog
 SEEN_FILE = "seen.json"
 CALLS_FILE = "calls_log.json"
@@ -199,11 +199,14 @@ def ask_ai(hits, quotes):
 
     providers = []
     if GEMINI_API_KEY:
-        providers.append(("gemini", lambda: requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-            json={"contents": [{"parts": [{"text": prompt}]}],
-                  "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}, timeout=60)))
+        for gm in GEMINI_MODELS:
+            cfg = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 1800}
+            if gm.startswith("gemini-2.5"):
+                cfg["thinkingConfig"] = {"thinkingBudget": 0}      # no 'thinking' = fast answer
+            providers.append(("gemini", lambda gm=gm, cfg=cfg: requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent",
+                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}, timeout=40)))
     if GITHUB_TOKEN:
         providers.append(("github", lambda: requests.post(
             "https://models.github.ai/inference/chat/completions",
