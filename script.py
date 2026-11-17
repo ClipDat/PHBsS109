@@ -169,23 +169,30 @@ def ask_ai(hits, quotes):
         "Use confidence 'high' ONLY for hard, specific news (rate decisions, earnings numbers, sanctions, official actions). "
         "If the last-session change already moved a lot in the direction the news implies, say priced_in=yes."
     )
-    try:
-        r = requests.post("https://models.github.ai/inference/chat/completions",
-                          headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json",
-                                   "Content-Type": "application/json"},
-                          json={"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}],
-                                "temperature": 0.2, "max_tokens": 1400}, timeout=60)
-        if r.status_code != 200:
-            AI_ERROR = f"HTTP {r.status_code}: {r.text[:160]}"
-            print("AI analysis failed:", AI_ERROR)
-            return None
-        text = r.json()["choices"][0]["message"]["content"]
-        text = text[text.index("{"): text.rindex("}") + 1]
-        return clean_analysis(json.loads(text), len(hits))
-    except Exception as e:
-        AI_ERROR = f"{type(e).__name__}: {str(e)[:160]}"
-        print(f"AI analysis failed: {AI_ERROR}")
-        return None
+    endpoints = ["https://models.github.ai/inference/chat/completions",
+                 "https://models.inference.ai.azure.com/chat/completions"]
+    models = [AI_MODEL, AI_MODEL.split("/")[-1]]
+    errors = []
+    for url, model in zip(endpoints, models):
+        try:
+            r = requests.post(url,
+                              headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/json",
+                                       "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
+                              json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                                    "temperature": 0.2, "max_tokens": 1400}, timeout=60)
+            body = (r.text or "").strip()
+            if r.status_code != 200 or not body:
+                errors.append(f"{url.split('/')[2]} HTTP {r.status_code}: {body[:120] or '(empty reply)'}")
+                continue
+            text = r.json()["choices"][0]["message"]["content"]
+            text = text[text.index("{"): text.rindex("}") + 1]
+            AI_ERROR = ""
+            return clean_analysis(json.loads(text), len(hits))
+        except Exception as e:
+            errors.append(f"{url.split('/')[2]} {type(e).__name__}: {str(e)[:100]} | reply: {(locals().get('r') and r.text or '')[:100]!r}")
+    AI_ERROR = " || ".join(errors)
+    print("AI analysis failed:", AI_ERROR)
+    return None
 
 
 def clean_analysis(data, n_hits):
