@@ -33,7 +33,8 @@ AI_MODEL = "openai/gpt-4o-mini"          # any model from the GitHub Models cata
 SEEN_FILE = "seen.json"
 CALLS_FILE = "calls_log.json"
 SCORE_FILE = "scorecard.csv"
-MAX_HEADLINES = 8                         # per notification; extras wait for the next run
+MAX_HEADLINES = 16                        # per run; extras wait for the next run
+PER_MESSAGE = 6                           # headlines per notification (phone limit ~4000 chars)
 MAX_QUOTES = 24                           # price lookups per run
 SCORE_AFTER_H = 24                        # check an AI call against the real price after this many hours
 
@@ -52,6 +53,18 @@ FEEDS = [
     "https://venturebeat.com/category/ai/feed/",
     "https://oilprice.com/rss/main",
     "https://feeds.bbci.co.uk/news/world/rss.xml",
+    # stock-focused sources
+    "https://seekingalpha.com/market_currents.xml",
+    "https://www.benzinga.com/feed",
+    "https://www.investing.com/rss/news.rss",
+    "https://www.cnbc.com/id/15839069/device/rss/rss.html",
+    "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+    "https://feeds.marketwatch.com/marketwatch/marketpulse/",
+    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL,MSFT,NVDA,AMZN,META,TSLA,GOOGL,AMD,NFLX,PLTR&region=US&lang=en-US",
+    "https://news.google.com/rss/search?q=stock+earnings+OR+guidance+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=analyst+upgrade+OR+downgrade+OR+%22price+target%22+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=shares+surge+OR+shares+plunge+OR+stock+jumps+OR+stock+falls+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=acquisition+OR+merger+OR+buyback+OR+layoffs+OR+%22FDA+approval%22+when:1d&hl=en-US&gl=US&ceid=US:en",
 ]
 
 KEYWORD_GROUPS = {
@@ -61,10 +74,46 @@ KEYWORD_GROUPS = {
     "oil_energy": ["opec", "oil price", "crude", "pipeline", "oil supply", "natural gas", "strait of hormuz"],
     "fed_rates": ["federal reserve", "interest rate", "fed chair", "rate cut", "rate hike", "powell", "fomc"],
     "market_moving": ["earnings beat", "earnings miss", "stock plunge", "stock surge", "market sell-off", "recession", "inflation report", "jobs report", "gdp growth", "bankruptcy", "ipo"],
+    "stocks": ["earnings", "guidance", "price target", "upgrade", "downgrade", "shares jump", "shares fall", "shares surge",
+               "shares plunge", "stock jumps", "stock falls", "stock soars", "stock tumbles", "buyback", "dividend", "acquisition",
+               "acquire", "merger", "layoffs", "fda approval", "recall", "lawsuit", "antitrust", "short seller", "stock split",
+               "profit warning", "revenue forecast", "ceo steps down", "to buy", "outlook"],
     "geopolitics": ["sanctions", "military strike", "invasion", "ceasefire", "trade war", "tariffs", "war"],
     "trump_crypto": {"a": ["trump"], "b": ["coin", "token", "crypto", "bitcoin", "memecoin"]},
     "trump_geopolitics": {"a": ["trump"], "b": ["iran", "strike", "attack", "military", "sanctions", "israel", "china tariff"]},
 }
+
+# Well-known companies, matched by name in any headline (so you also get news that has no "market" keyword).
+WATCHLIST = {
+    "Apple": "AAPL", "Microsoft": "MSFT", "Nvidia": "NVDA", "Amazon": "AMZN", "Alphabet": "GOOGL", "Google": "GOOGL",
+    "Meta Platforms": "META", "Facebook": "META", "Tesla": "TSLA", "Broadcom": "AVGO", "Netflix": "NFLX",
+    "AMD": "AMD", "Advanced Micro Devices": "AMD", "Intel": "INTC", "Micron": "MU", "Qualcomm": "QCOM", "Oracle": "ORCL",
+    "Salesforce": "CRM", "Adobe": "ADBE", "Palantir": "PLTR", "Uber": "UBER", "Airbnb": "ABNB", "Disney": "DIS",
+    "Boeing": "BA", "JPMorgan": "JPM", "Goldman Sachs": "GS", "Morgan Stanley": "MS", "Bank of America": "BAC",
+    "Wells Fargo": "WFC", "Citigroup": "C", "Visa": "V", "Mastercard": "MA", "PayPal": "PYPL", "Coinbase": "COIN",
+    "Robinhood": "HOOD", "MicroStrategy": "MSTR", "Marathon Digital": "MARA", "Riot Platforms": "RIOT",
+    "Walmart": "WMT", "Costco": "COST", "Target": "TGT", "Nike": "NKE", "Starbucks": "SBUX", "McDonald's": "MCD",
+    "Coca-Cola": "KO", "PepsiCo": "PEP", "Pfizer": "PFE", "Eli Lilly": "LLY", "Novo Nordisk": "NVO", "Moderna": "MRNA",
+    "Johnson & Johnson": "JNJ", "UnitedHealth": "UNH", "Exxon": "XOM", "Chevron": "CVX", "Occidental": "OXY",
+    "ConocoPhillips": "COP", "Lockheed": "LMT", "Raytheon": "RTX", "Snowflake": "SNOW", "CrowdStrike": "CRWD",
+    "Shopify": "SHOP", "Spotify": "SPOT", "TSMC": "TSM", "Taiwan Semiconductor": "TSM", "ASML": "ASML",
+    "Super Micro": "SMCI", "Arm Holdings": "ARM", "Berkshire Hathaway": "BRK-B", "Ford": "F", "General Motors": "GM",
+    "Rivian": "RIVN", "Lucid": "LCID", "Delta Air": "DAL", "United Airlines": "UAL", "American Airlines": "AAL",
+    "Carnival": "CCL", "Home Depot": "HD", "Lowe's": "LOW", "Cisco": "CSCO", "IBM": "IBM", "Dell": "DELL",
+    "Reddit": "RDDT", "Snap Inc": "SNAP", "Pinterest": "PINS", "Roblox": "RBLX", "Unity Software": "U",
+    "Take-Two": "TTWO", "Electronic Arts": "EA", "Nintendo": "NTDOY", "Sony": "SONY", "Alibaba": "BABA",
+    "Rocket Lab": "RKLB", "SoFi": "SOFI", "Intuitive Machines": "LUNR", "Trump Media": "DJT",
+}
+WATCH_RE = [(re.compile(r"\b" + re.escape(n) + r"\b"), t) for n, t in WATCHLIST.items()]
+
+
+def tickers_in(text):
+    out = []
+    for rx, t in WATCH_RE:
+        if rx.search(text) and t not in out:
+            out.append(t)
+    return out[:3]
+
 
 # Assets each topic could move (Yahoo Finance symbols). The AI may add others.
 CANDIDATES = {
@@ -75,6 +124,8 @@ CANDIDATES = {
     "fed_rates": ["^TNX", "QQQ", "JPM", "BAC", "XHB"],
     "market_moving": ["SPY", "QQQ"],
     "geopolitics": ["CL=F", "GLD", "LMT", "RTX", "XOM"],
+    "stocks": [],
+    "company": [],
     "trump_crypto": ["BTC-USD", "COIN", "MSTR", "DJT"],
     "trump_geopolitics": ["CL=F", "GLD", "LMT", "RTX", "XOM"],
 }
@@ -154,7 +205,8 @@ def ask_ai(hits, quotes):
         AI_ERROR = "no AI key passed in - the workflow needs env GITHUB_TOKEN and/or GEMINI_API_KEY"
         return None
     today = datetime.now(timezone.utc).strftime("%A %Y-%m-%d")
-    heads = "\n".join(f"{i}. [{h['group']}] {h['title']} -- {h['summary'][:220]}" for i, h in enumerate(hits, 1))
+    heads = "\n".join(f"{i}. [{h['group']}] {h['title']} -- {h['summary'][:200]}"
+                      + (f" (companies: {', '.join(h['names'])})" if h.get("names") else "") for i, h in enumerate(hits, 1))
     px = {t: {"last": round(q["price"], 2), "last_session_change_pct": None if q["chg"] is None else round(q["chg"], 2)}
           for t, q in quotes.items() if q}
     prompt = (
@@ -167,7 +219,9 @@ def ask_ai(hits, quotes):
         '{"overall": "one sentence", "items": [{"n": 1, "market_moving": true, "calls": [{"ticker": "XOM", '
         '"lean": "up|down|unclear", "horizon": "hours|days|weeks", "confidence": "low|medium|high", '
         '"priced_in": "yes|no|unknown", "why": "max 20 words"}]}]}\n'
-        "Rules: set market_moving=false (and no calls) for routine, rumor-only, opinion or already widely known news. "
+        "Rules: news about a specific company (earnings, guidance, analyst upgrades/downgrades, deals, lawsuits, product launches, "
+        "layoffs, executive changes, regulatory decisions) IS market moving for that company's stock: give a call for it. "
+        "Set market_moving=false only for pure opinion, ads, lifestyle pieces or stale news. "
         "Use only real tickers (Yahoo symbols like BTC-USD, CL=F). Max 3 calls per headline. Prefer 'unclear' over guessing. "
         "Use confidence 'high' ONLY for hard, specific news (rate decisions, earnings numbers, sanctions, official actions). "
         "If the last-session change already moved a lot in the direction the news implies, say priced_in=yes."
@@ -214,7 +268,7 @@ def ask_ai(hits, quotes):
             return names
 
         def gemini_call(gm):
-            cfg = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 2500}
+            cfg = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 6000}
             resp = None
             for attempt_no in range(3):                      # Google says 'high demand' now and then: wait and retry
                 resp = requests.post(
@@ -234,7 +288,7 @@ def ask_ai(hits, quotes):
             headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json",
                      "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
             json={"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0.2, "max_tokens": 1400}, timeout=60)))
+                  "temperature": 0.2, "max_tokens": 3500}, timeout=60)))
     for name, fn in providers:
         result = attempt(name, fn)
         if result:
@@ -332,9 +386,9 @@ def scorecard_line():
 ARROW = {"up": "▲ UP", "down": "▼ DOWN", "unclear": "? unclear"}
 
 
-def build_message(hits, analysis, quotes):
+def build_message(hits, analysis, quotes, start=0, last=True):
     parts, quiet = [], 0
-    for i, h in enumerate(hits, 1):
+    for i, h in enumerate(hits, start + 1):
         it = analysis["items"].get(i) if analysis else None
         if analysis and it and not it["market_moving"]:
             quiet += 1
@@ -349,17 +403,19 @@ def build_message(hits, analysis, quotes):
                           f"\n   {c['why']}")
         elif not analysis:
             groups = h["group"].replace("_", " ")
-            block += f"\n   (AI unavailable) could affect: {', '.join(CANDIDATES.get(h['group'], [])[:5])} [{groups}]"
+            may = h.get("names", []) + CANDIDATES.get(h["group"], [])
+            block += f"\n   (AI unavailable) could affect: {', '.join(may[:5])} [{groups}]"
         parts.append(block)
     text = "\n\n".join(parts) if parts else "No market-moving headlines in this batch."
     if quiet:
         text += f"\n\n+{quiet} headline(s) judged not market-moving."
-    if analysis and analysis["overall"]:
-        text += f"\n\nOverall: {analysis['overall']}"
-    if not analysis and AI_ERROR:
-        text += f"\n\nAI error: {AI_ERROR}"
-    text += f"\n\n{scorecard_line()}\nAI guess from headlines only, not advice. Check the price before acting."
-    return text[:3700]
+    if last:
+        if analysis and analysis["overall"]:
+            text += f"\n\nOverall: {analysis['overall']}"
+        if not analysis and AI_ERROR:
+            text += f"\n\nAI error: {AI_ERROR}"
+        text += f"\n\n{scorecard_line()}\nAI guess from headlines only, not advice. Check the price before acting."
+    return text[:3900]
 
 
 def send(title, message):
@@ -383,15 +439,19 @@ def main():
         except Exception as e:
             print(f"Failed to parse {url}: {e}")
             continue
-        for e in parsed.entries[:20]:
+        for e in parsed.entries[:30]:
             link = e.get("link", "")
             if not link or link in seen:
                 continue
             title, summary = clean(e.get("title", "")), clean(e.get("summary", ""))
-            group = next((g for g, d in KEYWORD_GROUPS.items() if matches(f"{title} {summary}", d)), None)
+            text = f"{title} {summary}"
+            group = next((g for g, d in KEYWORD_GROUPS.items() if matches(text, d)), None)
+            names = tickers_in(title)                 # company named in the headline itself
+            if names and not group:
+                group = "company"
             if group:
                 if link not in hit_links:
-                    hits.append(dict(title=title, summary=summary, link=link, group=group))
+                    hits.append(dict(title=title, summary=summary, link=link, group=group, names=names))
                     hit_links.add(link)
             else:
                 new_seen.add(link)
@@ -402,7 +462,7 @@ def main():
     if batch:
         cands = []
         for h in batch:
-            for t in CANDIDATES.get(h["group"], []):
+            for t in h.get("names", []) + CANDIDATES.get(h["group"], []):
                 if t not in cands:
                     cands.append(t)
         quotes = fetch_quotes(cands)
@@ -411,7 +471,11 @@ def main():
             extra = [c["ticker"] for it in analysis["items"].values() for c in it["calls"]]
             quotes = fetch_quotes(extra, quotes)
             log_calls(batch, analysis, quotes)
-        send(f"📰 Market digest ({len(batch)})", build_message(batch, analysis, quotes))
+        for k in range(0, len(batch), PER_MESSAGE):
+            part = batch[k:k + PER_MESSAGE]
+            last = k + PER_MESSAGE >= len(batch)
+            send(f"📰 Market digest {k // PER_MESSAGE + 1}/{(len(batch) - 1) // PER_MESSAGE + 1}",
+                 build_message(batch, analysis, quotes, start=k, last=last) if not part == [] else "")
         print(f"Sent digest with {len(batch)} headlines (AI: {'yes' if analysis else 'no'})")
         for h in batch:
             new_seen.add(h["link"])
