@@ -28,13 +28,13 @@ import requests
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "changeme-topic")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")      # optional, free from aistudio.google.com/apikey
-GEMINI_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"]   # tried first; the script also asks Google which models exist
+GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-flash-latest"]   # tried first; the script also asks Google which models exist
 AI_MODEL = "openai/gpt-4o-mini"          # any model from the GitHub Models catalog
 SEEN_FILE = "seen.json"
 CALLS_FILE = "calls_log.json"
 SCORE_FILE = "scorecard.csv"
-MAX_HEADLINES = 16                        # per run; extras wait for the next run
-PER_MESSAGE = 6                           # headlines per notification (phone limit ~4000 chars)
+MAX_HEADLINES = 10                        # per run; extras wait for the next run
+PER_MESSAGE = 5                           # headlines per notification (phone limit ~4000 chars)
 MAX_QUOTES = 24                           # price lookups per run
 SCORE_AFTER_H = 24                        # check an AI call against the real price after this many hours
 
@@ -270,14 +270,14 @@ def ask_ai_batch(hits, quotes):
         def gemini_call(gm):
             cfg = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 3000}
             resp = None
-            for attempt_no in range(3):                      # Google says 'high demand' now and then: wait and retry
+            for attempt_no in range(2):                      # Google says 'high demand' now and then: wait and retry
                 resp = requests.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent",
                     headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-                    json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}, timeout=60)
-                if resp.status_code not in (429, 500, 502, 503, 504):
+                    json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}, timeout=45)
+                if resp.status_code not in (500, 502, 503, 504):     # 429 = quota: retrying only burns more quota
                     break
-                time.sleep(6 * (attempt_no + 1))
+                time.sleep(8 * (attempt_no + 1))
             return resp
 
         for gm in gemini_models():
@@ -299,7 +299,7 @@ def ask_ai_batch(hits, quotes):
     return None
 
 
-AI_BATCH = 6          # headlines per AI request: short answers, less chance of cut-off replies or quota trouble
+AI_BATCH = 5          # headlines per AI request: short answers, less chance of cut-off replies or quota trouble
 
 
 def ask_ai(hits, quotes):
@@ -308,6 +308,8 @@ def ask_ai(hits, quotes):
     merged = {"overall": "", "items": {}}
     errors, ok = [], False
     for k in range(0, len(hits), AI_BATCH):
+        if k:
+            time.sleep(12)                       # free tier allows only a few requests per minute
         res = ask_ai_batch(hits[k:k + AI_BATCH], quotes)
         if res:
             ok = True
@@ -482,6 +484,8 @@ def main():
     score_old_calls()
 
     batch = hits[:MAX_HEADLINES]
+    for h in hits[MAX_HEADLINES * 3:]:           # too many to ever catch up on: skip the oldest overflow
+        new_seen.add(h["link"])
     if batch:
         cands = []
         for h in batch:
@@ -497,7 +501,7 @@ def main():
         for k in range(0, len(batch), PER_MESSAGE):
             part = batch[k:k + PER_MESSAGE]
             last = k + PER_MESSAGE >= len(batch)
-            send(f"📰 Market digest {k // PER_MESSAGE + 1}/{(len(batch) - 1) // PER_MESSAGE + 1}",
+            send(f"Market digest {k // PER_MESSAGE + 1}/{(len(batch) - 1) // PER_MESSAGE + 1}",
                  build_message(part, analysis, quotes, start=k, last=last))
         print(f"Sent digest with {len(batch)} headlines (AI: {'yes' if analysis else 'no'})")
         for h in batch:
