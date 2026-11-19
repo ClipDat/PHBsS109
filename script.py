@@ -199,7 +199,7 @@ def fetch_quotes(tickers, have=None):
 AI_ERROR = ""
 
 
-def ask_ai(hits, quotes):
+def ask_ai_batch(hits, quotes):
     global AI_ERROR
     if not GITHUB_TOKEN and not GEMINI_API_KEY:
         AI_ERROR = "no AI key passed in - the workflow needs env GITHUB_TOKEN and/or GEMINI_API_KEY"
@@ -268,7 +268,7 @@ def ask_ai(hits, quotes):
             return names
 
         def gemini_call(gm):
-            cfg = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 6000}
+            cfg = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 3000}
             resp = None
             for attempt_no in range(3):                      # Google says 'high demand' now and then: wait and retry
                 resp = requests.post(
@@ -288,7 +288,7 @@ def ask_ai(hits, quotes):
             headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json",
                      "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
             json={"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0.2, "max_tokens": 3500}, timeout=60)))
+                  "temperature": 0.2, "max_tokens": 2000}, timeout=60)))
     for name, fn in providers:
         result = attempt(name, fn)
         if result:
@@ -297,6 +297,27 @@ def ask_ai(hits, quotes):
     AI_ERROR = " || ".join(errors) or "no AI key available"
     print("AI analysis failed:", AI_ERROR)
     return None
+
+
+AI_BATCH = 6          # headlines per AI request: short answers, less chance of cut-off replies or quota trouble
+
+
+def ask_ai(hits, quotes):
+    """Ask the AI in small groups, so one failed or cut-off answer only affects its own group."""
+    global AI_ERROR
+    merged = {"overall": "", "items": {}}
+    errors, ok = [], False
+    for k in range(0, len(hits), AI_BATCH):
+        res = ask_ai_batch(hits[k:k + AI_BATCH], quotes)
+        if res:
+            ok = True
+            merged["overall"] = merged["overall"] or res["overall"]
+            for n, it in res["items"].items():
+                merged["items"][n + k] = it
+        else:
+            errors.append(f"headlines {k + 1}-{min(k + AI_BATCH, len(hits))}: {AI_ERROR}")
+    AI_ERROR = " ## ".join(errors)
+    return merged if ok else None
 
 
 def clean_analysis(data, n_hits):
@@ -401,12 +422,14 @@ def build_message(hits, analysis, quotes, start=0, last=True):
                 pin = " | likely priced in" if c["priced_in"] == "yes" else ""
                 block += (f"\n   {c['ticker']} {ARROW[c['lean']]} ({c['confidence']}, {c['horizon']}){pin}{last}"
                           f"\n   {c['why']}")
-        elif not analysis:
+        elif not it:
             groups = h["group"].replace("_", " ")
             may = h.get("names", []) + CANDIDATES.get(h["group"], [])
-            block += f"\n   (AI unavailable) could affect: {', '.join(may[:5])} [{groups}]"
+            block += f"\n   (no AI answer) could affect: {', '.join(may[:5])} [{groups}]"
         parts.append(block)
     text = "\n\n".join(parts) if parts else "No market-moving headlines in this batch."
+    if start == 0 and AI_ERROR:
+        text = f"⚠ AI problem: {AI_ERROR[:380]}\n\n" + text
     if quiet:
         text += f"\n\n+{quiet} headline(s) judged not market-moving."
     if last:
@@ -475,7 +498,7 @@ def main():
             part = batch[k:k + PER_MESSAGE]
             last = k + PER_MESSAGE >= len(batch)
             send(f"📰 Market digest {k // PER_MESSAGE + 1}/{(len(batch) - 1) // PER_MESSAGE + 1}",
-                 build_message(batch, analysis, quotes, start=k, last=last) if not part == [] else "")
+                 build_message(part, analysis, quotes, start=k, last=last))
         print(f"Sent digest with {len(batch)} headlines (AI: {'yes' if analysis else 'no'})")
         for h in batch:
             new_seen.add(h["link"])
