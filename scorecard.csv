@@ -54,3 +54,10 @@ time,ticker,lean,confidence,horizon,move_pct,correct
 2026-11-20T12:51:32+00:00,BTC-USD,down,low,days,-2.74,1
 2026-11-20T12:51:32+00:00,BTC-USD,up,medium,weeks,-2.74,0
 2026-11-20T12:51:32+00:00,ETH-USD,down,medium,weeks,-3.37,1
+2026-11-20T20:53:30+00:00,BTC-USD,down,high,hours,3.45,0
+2026-11-20T20:53:30+00:00,COIN,down,medium,days,-1.02,1
+2026-11-20T20:53:30+00:00,MSTR,down,medium,days,-0.97,1
+2026-11-20T20:53:30+00:00,BTC-USD,down,high,hours,3.45,0
+2026-11-20T20:53:30+00:00,BTC-USD,down,medium,days,3.45,0
+2026-11-20T20:53:30+00:00,BTC-USD,down,medium,hours,3.45,0
+2026-11-20T20:53:30+00:00,ETH-USD,down,low,days,5.34,0
