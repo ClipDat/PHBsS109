@@ -68,3 +68,6 @@ time,ticker,lean,confidence,horizon,move_pct,correct
 2026-11-21T09:10:34+00:00,XRP-USD,down,high,hours,3.65,0
 2026-11-21T09:10:34+00:00,BTC-USD,down,high,days,3.6,0
 2026-11-21T09:10:34+00:00,BTC-USD,down,medium,days,3.6,0
+2026-11-21T16:47:51+00:00,ETH-USD,up,low,days,1.76,1
+2026-11-21T16:47:51+00:00,BTC-USD,down,low,hours,1.39,0
+2026-11-21T16:47:51+00:00,ETH-USD,down,low,days,1.76,0
