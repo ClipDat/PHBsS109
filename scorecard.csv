@@ -135,3 +135,13 @@ time,ticker,lean,confidence,horizon,move_pct,correct
 2026-11-24T10:12:28+00:00,BTC-USD,down,medium,days,-2.62,1
 2026-11-24T10:12:28+00:00,BTC-USD,down,medium,days,-2.62,1
 2026-11-24T10:12:28+00:00,COIN,down,low,days,-5.91,1
+2026-11-24T20:39:49+00:00,BTC-USD,down,medium,days,1.16,0
+2026-11-24T20:39:49+00:00,BTC-USD,up,low,weeks,1.16,1
+2026-11-24T20:39:49+00:00,BTC-USD,down,medium,days,1.16,0
+2026-11-24T20:39:49+00:00,BTC-USD,down,high,days,1.16,0
+2026-11-24T20:39:49+00:00,BTC-USD,down,high,hours,1.16,0
+2026-11-24T20:39:49+00:00,NVDA,down,medium,days,-2.11,1
+2026-11-24T20:39:49+00:00,BTC-USD,down,medium,weeks,1.16,0
+2026-11-24T20:39:49+00:00,BTC-USD,up,medium,weeks,1.16,1
+2026-11-24T20:39:49+00:00,BTC-USD,down,high,hours,1.16,0
+2026-11-24T20:39:49+00:00,NVDA,down,medium,days,-2.11,1
