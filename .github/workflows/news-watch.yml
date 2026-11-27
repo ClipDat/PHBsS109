@@ -1,34 +1,623 @@
-name: News watch (AI)
+"""
+News watcher with AI analysis.
 
-on:
-  schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
+Every run (about every 15 min on GitHub Actions) it:
+  1. reads the RSS feeds and picks NEW headlines that match your keyword groups,
+  2. looks up the last-session move of the stocks/coins they could affect (Yahoo Finance, free),
+  3. asks an AI (GitHub Models, free) which assets each headline could move, in which direction,
+     how confident it is, and whether the news is probably priced in already,
+  4. sends ONE phone notification (ntfy) with the headlines, links and the AI's lean per ticker,
+  5. keeps a SCORECARD: every AI call is checked ~24 h later against the real price, so you can see
+     whether its calls beat a coin flip before you trust them.
 
-permissions:
-  contents: write
-  models: read
+This is a reading aid, not advice. The AI only sees headlines and prices. It cannot know where a price
+will go, and most headlines are already priced in within minutes.
+"""
 
-jobs:
-  watch:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - run: pip install -r requirements.txt
-      - name: Run watcher
-        env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python script.py
-      - name: Save state
-        run: |
-          git config user.name "news-bot"
-          git config user.email "news-bot@users.noreply.github.com"
-          git add seen.json calls_log.json scorecard.csv
-          git diff --cached --quiet || git commit -m "update state"
-          git pull --no-rebase -X ours origin main
-          git push
+import csv
+import html
+import json
+import os
+import re
+import time
+from datetime import datetime, timezone
+
+import feedparser
+import requests
+
+feedparser.USER_AGENT = "Mozilla/5.0 (compatible; personal-news-bot/1.0)"
+
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "changeme-topic")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")      # optional, free from aistudio.google.com/apikey
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")          # optional, free from console.groq.com/keys
+GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+DEAD = set()          # models that refused us during this run (quota/broken): skip them for the next groups
+GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-flash-latest"]   # tried first; the script also asks Google which models exist
+AI_MODEL = "openai/gpt-4o-mini"          # any model from the GitHub Models catalog
+SEEN_FILE = "seen.json"
+CALLS_FILE = "calls_log.json"
+SCORE_FILE = "scorecard.csv"
+MAX_HEADLINES = 15                        # per run; extras wait for the next run
+PER_MESSAGE = 5                           # headlines per notification (phone limit ~4000 chars)
+MAX_QUOTES = 24                           # price lookups per run
+SCORE_AFTER_H = 24                        # check an AI call against the real price after this many hours
+
+FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://www.theblock.co/rss.xml",
+    "https://decrypt.co/feed",
+    "https://bitcoinmagazine.com/feed",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "https://www.cnbc.com/id/10001147/device/rss/rss.html",
+    "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "https://finance.yahoo.com/news/rssindex",
+    "https://www.cnbc.com/id/19854910/device/rss/rss.html",
+    "https://techcrunch.com/category/artificial-intelligence/feed/",
+    "https://venturebeat.com/category/ai/feed/",
+    "https://oilprice.com/rss/main",
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    # stock-focused sources
+    "https://seekingalpha.com/market_currents.xml",
+    "https://www.benzinga.com/feed",
+    "https://www.investing.com/rss/news.rss",
+    "https://www.cnbc.com/id/15839069/device/rss/rss.html",
+    "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+    "https://feeds.marketwatch.com/marketwatch/marketpulse/",
+    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL,MSFT,NVDA,AMZN,META,TSLA,GOOGL,AMD,NFLX,PLTR&region=US&lang=en-US",
+    "https://news.google.com/rss/search?q=stock+earnings+OR+guidance+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=analyst+upgrade+OR+downgrade+OR+%22price+target%22+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=shares+surge+OR+shares+plunge+OR+stock+jumps+OR+stock+falls+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=acquisition+OR+merger+OR+buyback+OR+layoffs+OR+%22FDA+approval%22+when:1d&hl=en-US&gl=US&ceid=US:en",
+    # social chatter (X/Twitter has no free access any more; Reddit is the free stand-in)
+    "https://www.reddit.com/r/stocks/new/.rss",
+    "https://www.reddit.com/r/investing/new/.rss",
+    "https://www.reddit.com/r/wallstreetbets/hot/.rss",
+    "https://www.reddit.com/r/CryptoCurrency/hot/.rss",
+    "https://www.reddit.com/r/SecurityAnalysis/new/.rss",
+    # politicians, central banks
+    "https://trumpstruth.org/feed",
+    "https://www.federalreserve.gov/feeds/press_all.xml",
+    # defense, space, chips
+    "https://www.defensenews.com/arc/outboundfeeds/rss/?outputType=xml",
+    "https://breakingdefense.com/feed/",
+    "https://spacenews.com/feed/",
+    "https://www.theverge.com/rss/index.xml",
+    # one targeted search per theme you asked about
+    "https://news.google.com/rss/search?q=Lockheed+OR+Northrop+OR+Raytheon+OR+%22General+Dynamics%22+OR+Pentagon+contract+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=AMD+OR+Intel+OR+Micron+OR+Broadcom+OR+TSMC+OR+semiconductor+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=SpaceX+OR+SPCX+OR+Starship+OR+Starlink+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=Nvidia+OR+OpenAI+OR+Anthropic+OR+%22AI+chips%22+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=Bitcoin+OR+Ethereum+OR+Solana+OR+XRP+OR+%22crypto+ETF%22+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=oil+OR+OPEC+OR+Iran+OR+%22Strait+of+Hormuz%22+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=Tesla+OR+Apple+OR+Microsoft+OR+Amazon+OR+Google+OR+Meta+stock+when:1d&hl=en-US&gl=US&ceid=US:en",
+]
+
+KEYWORD_GROUPS = {
+    "crypto": ["crypto", "bitcoin", "ethereum", "coin", "token", "stablecoin", "memecoin", "defi", "sec crypto", "solana", "xrp"],
+    "ai": ["openai", "chatgpt", "anthropic", "claude ai", "artificial intelligence", " ai model", "nvidia", "gpu chip", "deepseek", "gemini"],
+    "big_tech": ["apple", "google", "microsoft", "amazon", "meta platforms", "tesla", "nvidia", "alphabet"],
+    "oil_energy": ["opec", "oil price", "crude", "pipeline", "oil supply", "natural gas", "strait of hormuz"],
+    "fed_rates": ["federal reserve", "interest rate", "fed chair", "rate cut", "rate hike", "powell", "fomc"],
+    "market_moving": ["earnings beat", "earnings miss", "stock plunge", "stock surge", "market sell-off", "recession", "inflation report", "jobs report", "gdp growth", "bankruptcy", "ipo"],
+    "stocks": ["earnings", "guidance", "price target", "upgrade", "downgrade", "shares jump", "shares fall", "shares surge",
+               "shares plunge", "stock jumps", "stock falls", "stock soars", "stock tumbles", "buyback", "dividend", "acquisition",
+               "acquire", "merger", "layoffs", "fda approval", "recall", "lawsuit", "antitrust", "short seller", "stock split",
+               "profit warning", "revenue forecast", "ceo steps down", "to buy", "outlook"],
+    "defense": ["pentagon", "defense contract", "missile", "fighter jet", "f-35", "f-47", "nato", "defense budget", "air defense", "drone"],
+    "space": ["spacex", "spcx", "starship", "starlink", "rocket launch", "nasa", "satellite", "space force"],
+    "semis": ["chip", "semiconductor", "export controls", "data center", "hbm", "wafer", "foundry", "tsmc"],
+    "geopolitics": ["sanctions", "military strike", "invasion", "ceasefire", "trade war", "tariffs", "war"],
+    "trump_crypto": {"a": ["trump"], "b": ["coin", "token", "crypto", "bitcoin", "memecoin"]},
+    "trump_geopolitics": {"a": ["trump"], "b": ["iran", "strike", "attack", "military", "sanctions", "israel", "china tariff"]},
+}
+
+# Well-known companies, matched by name in any headline (so you also get news that has no "market" keyword).
+WATCHLIST = {
+    "Apple": "AAPL", "Microsoft": "MSFT", "Nvidia": "NVDA", "Amazon": "AMZN", "Alphabet": "GOOGL", "Google": "GOOGL",
+    "Meta Platforms": "META", "Facebook": "META", "Tesla": "TSLA", "Broadcom": "AVGO", "Netflix": "NFLX",
+    "AMD": "AMD", "Advanced Micro Devices": "AMD", "Intel": "INTC", "Micron": "MU", "Qualcomm": "QCOM", "Oracle": "ORCL",
+    "Salesforce": "CRM", "Adobe": "ADBE", "Palantir": "PLTR", "Uber": "UBER", "Airbnb": "ABNB", "Disney": "DIS",
+    "Boeing": "BA", "JPMorgan": "JPM", "Goldman Sachs": "GS", "Morgan Stanley": "MS", "Bank of America": "BAC",
+    "Wells Fargo": "WFC", "Citigroup": "C", "Visa": "V", "Mastercard": "MA", "PayPal": "PYPL", "Coinbase": "COIN",
+    "Robinhood": "HOOD", "MicroStrategy": "MSTR", "Marathon Digital": "MARA", "Riot Platforms": "RIOT",
+    "Walmart": "WMT", "Costco": "COST", "Target": "TGT", "Nike": "NKE", "Starbucks": "SBUX", "McDonald's": "MCD",
+    "Coca-Cola": "KO", "PepsiCo": "PEP", "Pfizer": "PFE", "Eli Lilly": "LLY", "Novo Nordisk": "NVO", "Moderna": "MRNA",
+    "Johnson & Johnson": "JNJ", "UnitedHealth": "UNH", "Exxon": "XOM", "Chevron": "CVX", "Occidental": "OXY",
+    "ConocoPhillips": "COP", "Lockheed": "LMT", "Raytheon": "RTX", "Snowflake": "SNOW", "CrowdStrike": "CRWD",
+    "Shopify": "SHOP", "Spotify": "SPOT", "TSMC": "TSM", "Taiwan Semiconductor": "TSM", "ASML": "ASML",
+    "Super Micro": "SMCI", "Arm Holdings": "ARM", "Berkshire Hathaway": "BRK-B", "Ford": "F", "General Motors": "GM",
+    "Rivian": "RIVN", "Lucid": "LCID", "Delta Air": "DAL", "United Airlines": "UAL", "American Airlines": "AAL",
+    "Carnival": "CCL", "Home Depot": "HD", "Lowe's": "LOW", "Cisco": "CSCO", "IBM": "IBM", "Dell": "DELL",
+    "Reddit": "RDDT", "Snap Inc": "SNAP", "Pinterest": "PINS", "Roblox": "RBLX", "Unity Software": "U",
+    "Take-Two": "TTWO", "Electronic Arts": "EA", "Nintendo": "NTDOY", "Sony": "SONY", "Alibaba": "BABA",
+    "Rocket Lab": "RKLB", "SoFi": "SOFI", "Intuitive Machines": "LUNR", "Trump Media": "DJT",
+    "SpaceX": "SPCX", "Space Exploration Technologies": "SPCX", "Starlink": "SPCX", "SPCX": "SPCX",
+    "Lockheed Martin": "LMT", "Northrop Grumman": "NOC", "General Dynamics": "GD", "L3Harris": "LHX", "RTX": "RTX",
+    "Huntington Ingalls": "HII", "AST SpaceMobile": "ASTS", "Planet Labs": "PL", "Virgin Galactic": "SPCE",
+    "Marvell": "MRVL", "Applied Materials": "AMAT", "Lam Research": "LRCX", "KLA": "KLAC", "Texas Instruments": "TXN",
+    "Western Digital": "WDC", "Seagate": "STX", "CoreWeave": "CRWV", "Nebius": "NBIS", "Oklo": "OKLO",
+    "Vistra": "VST", "Constellation Energy": "CEG", "Cameco": "CCJ", "Circle Internet": "CRCL", "Galaxy Digital": "GLXY",
+    "Pinduoduo": "PDD", "JD.com": "JD", "NIO": "NIO", "BYD": "BYDDY", "Shell": "SHEL", "BP": "BP",
+    "Lululemon": "LULU", "Chipotle": "CMG", "Palo Alto Networks": "PANW", "ServiceNow": "NOW", "Datadog": "DDOG",
+    "Zoom": "ZM", "Block Inc": "XYZ", "Affirm": "AFRM", "Moderna": "MRNA", "Novavax": "NVAX", "Merck": "MRK",
+    "AbbVie": "ABBV", "Bristol Myers": "BMY", "Intuit": "INTU", "AppLovin": "APP", "Twilio": "TWLO",
+}
+WATCH_RE = [(re.compile(r"\b" + re.escape(n) + r"\b"), t) for n, t in WATCHLIST.items()]
+
+
+def tickers_in(text):
+    out = []
+    for rx, t in WATCH_RE:
+        if rx.search(text) and t not in out:
+            out.append(t)
+    return out[:3]
+
+
+# Assets each topic could move (Yahoo Finance symbols). The AI may add others.
+CANDIDATES = {
+    "crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "COIN", "MSTR"],
+    "ai": ["NVDA", "AMD", "MSFT", "GOOGL", "SMCI"],
+    "big_tech": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA"],
+    "oil_energy": ["CL=F", "XOM", "CVX", "OXY", "DAL", "UAL"],
+    "fed_rates": ["^TNX", "QQQ", "JPM", "BAC", "XHB"],
+    "market_moving": ["SPY", "QQQ"],
+    "geopolitics": ["CL=F", "GLD", "LMT", "RTX", "XOM"],
+    "stocks": [],
+    "company": [],
+    "defense": ["LMT", "NOC", "RTX", "GD", "LHX"],
+    "space": ["SPCX", "RKLB", "ASTS", "LUNR"],
+    "semis": ["NVDA", "AMD", "AVGO", "TSM", "MU", "INTC"],
+    "trump_crypto": ["BTC-USD", "COIN", "MSTR", "DJT"],
+    "trump_geopolitics": ["CL=F", "GLD", "LMT", "RTX", "XOM"],
+}
+
+
+# ---------------------------------------------------------------- helpers
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def clean(text):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", text or ""))).strip()
+
+
+def matches(text, group_def):
+    t = text.lower()
+    if isinstance(group_def, dict):
+        return any(k in t for k in group_def["a"]) and any(k in t for k in group_def["b"])
+    return any(k in t for k in group_def)
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+def ensure_files():
+    for path, default in ((SEEN_FILE, []), (CALLS_FILE, [])):
+        if not os.path.exists(path):
+            write_json(path, default)
+    if not os.path.exists(SCORE_FILE):
+        with open(SCORE_FILE, "w", newline="") as f:
+            csv.writer(f).writerow(SCORE_COLS)
+    else:                                                   # older file without the new columns: upgrade it
+        rows = list(csv.DictReader(open(SCORE_FILE)))
+        with open(SCORE_FILE) as f:
+            header = f.readline().strip().split(",")
+        if header != SCORE_COLS:
+            with open(SCORE_FILE, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(SCORE_COLS)
+                for r in rows:
+                    w.writerow([r.get(k, "") for k in SCORE_COLS])
+
+
+# ---------------------------------------------------------------- prices
+def get_quote(ticker):
+    """Last price plus 1-day, 5-day and 1-month change in %. None if Yahoo does not answer (unofficial, can block)."""
+    try:
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+                         params={"range": "1mo", "interval": "1d"},
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        res = r.json()["chart"]["result"][0]
+        closes = [c for c in res["indicators"]["quote"][0]["close"] if c]
+        if not closes:
+            return None
+        price = closes[-1]
+        pct = lambda old: (price / old - 1) * 100
+        return {"price": price,
+                "chg": pct(closes[-2]) if len(closes) >= 2 else None,
+                "chg5": pct(closes[-6]) if len(closes) >= 6 else None,
+                "chg1m": pct(closes[0]) if len(closes) >= 15 else None}
+    except Exception:
+        return None
+
+
+def fetch_quotes(tickers, have=None):
+    quotes = dict(have or {})
+    for t in tickers:
+        if t not in quotes and len(quotes) < MAX_QUOTES:
+            quotes[t] = get_quote(t)
+    return quotes
+
+
+# ---------------------------------------------------------------- AI
+AI_ERROR = ""
+
+
+def ask_ai_batch(hits, quotes):
+    global AI_ERROR
+    if not (GITHUB_TOKEN or GEMINI_API_KEY or GROQ_API_KEY):
+        AI_ERROR = "no AI key passed in - the workflow needs env GITHUB_TOKEN and/or GEMINI_API_KEY"
+        return None
+    today = datetime.now(timezone.utc).strftime("%A %Y-%m-%d")
+    heads = "\n".join(f"{i}. [{h['group']}] {h['title']} -- {h['summary'][:200]}"
+                      + (f" (companies: {', '.join(h['names'])})" if h.get("names") else "") for i, h in enumerate(hits, 1))
+    rnd = lambda v: None if v is None else round(v, 1)
+    px = {t: {"last": round(q["price"], 2), "1d_pct": rnd(q["chg"]), "5d_pct": rnd(q.get("chg5")), "1m_pct": rnd(q.get("chg1m"))}
+          for t, q in quotes.items() if q}
+    prompt = (
+        "You help a retail trader read the news. You are cautious. You do not give investment advice; you describe the "
+        "LIKELY direction of impact and how sure you are.\n"
+        f"Today is {today} (UTC). US stock markets are closed on weekends, so a stock's reaction comes at the next open; "
+        "crypto trades 24/7.\n\n"
+        f"Headlines:\n{heads}\n\nPrice context (last session): {json.dumps(px)}\n\n"
+        "Reply with ONLY JSON, no other text, in this shape:\n"
+        '{"overall": "one sentence", "items": [{"n": 1, "market_moving": true, "calls": [{"ticker": "XOM", '
+        '"lean": "up|down|unclear", "horizon": "hours|days|weeks", "confidence": "low|medium|high", '
+        '"priced_in": "yes|no|unknown", "why": "max 20 words"}]}]}\n'
+        "Rules: news about a specific company (earnings, guidance, analyst upgrades/downgrades, deals, lawsuits, product launches, "
+        "layoffs, executive changes, regulatory decisions) IS market moving for that company's stock: give a call for it. "
+        "Set market_moving=false only for pure opinion, ads, lifestyle pieces or stale news. "
+        "Use only real tickers (Yahoo symbols like BTC-USD, CL=F). Max 3 calls per headline. Prefer 'unclear' over guessing. "
+        "Use confidence 'high' ONLY for hard, specific news (rate decisions, earnings numbers, sanctions, official actions). "
+        "If the price already moved a lot (1d_pct or 5d_pct) in the direction the news implies, say priced_in=yes and prefer lean unclear. "
+        "Headlines that merely REPORT a price move (\"shares jump\", \"stock falls\") describe the past: lean unclear, priced_in=yes. "
+        "Analyst price targets and reiterated ratings are weak signals: confidence low. A stock already up >20% in a month is stretched: be careful with up calls. "
+        "Think about second-order effects only if they are direct (a defense contract helps that contractor; a chip export ban hurts the chip seller)."
+    )
+    errors = []
+
+    def parse(text):
+        text = text[text.index("{"): text.rindex("}") + 1]
+        return clean_analysis(json.loads(text), len(hits))
+
+    def attempt(name, fn, label):
+        resp = None
+        try:
+            resp = fn()
+            body = (resp.text or "").strip()
+            if resp.status_code != 200 or not body:
+                errors.append(f"{label} HTTP {resp.status_code}: {body.replace(chr(10)," ")[:110] or '(empty reply)'}")
+                if resp.status_code == 429 or name == "github":
+                    DEAD.add(label)
+                return None
+            return parse(extract(name, resp))
+        except Exception as e:
+            shown = (resp.text or "")[:80] if resp is not None else ""
+            errors.append(f"{label} {type(e).__name__}: {str(e)[:90]} | reply: {shown!r}")
+            if name == "github":
+                DEAD.add(label)
+            return None
+
+    def extract(name, resp):
+        d = resp.json()
+        if name == "gemini":
+            return d["candidates"][0]["content"]["parts"][0]["text"]
+        return d["choices"][0]["message"]["content"]
+
+    providers = []
+    if GROQ_API_KEY:
+        for qm in GROQ_MODELS:
+            providers.append(("groq", lambda qm=qm: requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={"model": qm, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2,
+                      "max_tokens": 2000, "response_format": {"type": "json_object"}}, timeout=45), f"groq:{qm}"))
+    if GEMINI_API_KEY:
+        def gemini_models():
+            names = list(GEMINI_MODELS)
+            try:
+                r = requests.get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                                 headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=15)
+                found = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+                         if "generateContent" in m.get("supportedGenerationMethods", [])
+                         and "flash" in m["name"] and not re.search(r"image|tts|live|audio|embed|vision|thinking-exp|preview-\d", m["name"])]
+                names += sorted((n for n in found if n not in names), reverse=True)[:4]
+            except Exception:
+                pass
+            return names
+
+        def gemini_call(gm):
+            cfg = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 3000}
+            resp = None
+            for attempt_no in range(2):                      # Google says 'high demand' now and then: wait and retry
+                resp = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent",
+                    headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                    json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}, timeout=45)
+                if resp.status_code not in (500, 502, 503, 504):     # 429 = quota: retrying only burns more quota
+                    break
+                time.sleep(8 * (attempt_no + 1))
+            return resp
+
+        for gm in gemini_models():
+            providers.append(("gemini", lambda gm=gm: gemini_call(gm), f"gemini:{gm}"))
+    if GITHUB_TOKEN:
+        providers.append(("github", lambda: requests.post(
+            "https://models.github.ai/inference/chat/completions",
+            headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json",
+                     "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"},
+            json={"model": AI_MODEL, "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0.2, "max_tokens": 2000}, timeout=60), "github"))
+    for name, fn, label in providers:
+        if label in DEAD:
+            continue
+        result = attempt(name, fn, label)
+        if result:
+            AI_ERROR = ""
+            return result
+    AI_ERROR = " || ".join(errors) or "all AI models skipped (they failed earlier in this run)"
+    print("AI analysis failed:", AI_ERROR)
+    return None
+
+
+AI_BATCH = 5          # headlines per AI request: short answers, less chance of cut-off replies or quota trouble
+
+
+def ask_ai(hits, quotes):
+    """Ask the AI in small groups, so one failed or cut-off answer only affects its own group."""
+    global AI_ERROR
+    merged = {"overall": "", "items": {}}
+    errors, ok = [], False
+    for k in range(0, len(hits), AI_BATCH):
+        if k:
+            time.sleep(12)                       # free tier allows only a few requests per minute
+        res = ask_ai_batch(hits[k:k + AI_BATCH], quotes)
+        if res:
+            ok = True
+            merged["overall"] = merged["overall"] or res["overall"]
+            for n, it in res["items"].items():
+                merged["items"][n + k] = it
+        else:
+            errors.append(f"headlines {k + 1}-{min(k + AI_BATCH, len(hits))}: {AI_ERROR}")
+    AI_ERROR = " ## ".join(errors)
+    return merged if ok else None
+
+
+def clean_analysis(data, n_hits):
+    """Keep only well-formed fields so one odd answer cannot break the message."""
+    leans, confs, hors, pri = {"up", "down", "unclear"}, {"low", "medium", "high"}, {"hours", "days", "weeks"}, {"yes", "no", "unknown"}
+    items = {}
+    for it in data.get("items", []):
+        try:
+            n = int(it["n"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not 1 <= n <= n_hits:
+            continue
+        calls = []
+        if it.get("market_moving"):
+            for c in (it.get("calls") or [])[:3]:
+                t = str(c.get("ticker", "")).upper().strip()
+                if not re.fullmatch(r"[A-Z0-9.\-=^]{1,12}", t):
+                    continue
+                calls.append(dict(ticker=t,
+                                  lean=c.get("lean") if c.get("lean") in leans else "unclear",
+                                  horizon=c.get("horizon") if c.get("horizon") in hors else "days",
+                                  confidence=c.get("confidence") if c.get("confidence") in confs else "low",
+                                  priced_in=c.get("priced_in") if c.get("priced_in") in pri else "unknown",
+                                  why=clean(str(c.get("why", "")))[:140]))
+        items[n] = dict(market_moving=bool(it.get("market_moving")), calls=calls)
+    return dict(overall=clean(str(data.get("overall", "")))[:200], items=items)
+
+
+# ---------------------------------------------------------------- scorecard
+SCORE_COLS = ["time", "ticker", "lean", "confidence", "horizon", "move_pct", "excess_pct", "correct", "correct_vs_market"]
+
+
+def bench_for(ticker):
+    """Stocks are compared with SPY; crypto, futures and indexes have no fair benchmark here."""
+    if ticker.endswith("-USD") or "=F" in ticker or ticker.startswith("^") or ticker == "SPY":
+        return None
+    return "SPY"
+
+
+def log_calls(hits, analysis, quotes):
+    log = read_json(CALLS_FILE, [])
+    spy = quotes.get("SPY")
+    for n, it in analysis["items"].items():
+        for c in it["calls"]:
+            q = quotes.get(c["ticker"])
+            if c["lean"] in ("up", "down") and q:
+                b = bench_for(c["ticker"])
+                log.append(dict(ts=now_iso(), ticker=c["ticker"], lean=c["lean"], confidence=c["confidence"],
+                                horizon=c["horizon"], price0=q["price"], bench=b if spy else None,
+                                bench0=spy["price"] if (spy and b) else None, scored=False))
+    write_json(CALLS_FILE, log[-600:])
+
+
+def score_old_calls():
+    """Check calls older than SCORE_AFTER_H against the real price now (and against the market, SPY)."""
+    log = read_json(CALLS_FILE, [])
+    cache, changed = {}, False
+    now = datetime.now(timezone.utc)
+    for c in log:
+        if c.get("scored"):
+            continue
+        age_h = (now - datetime.fromisoformat(c["ts"])).total_seconds() / 3600
+        if age_h < SCORE_AFTER_H:
+            continue
+        for t in {c["ticker"], c.get("bench")} - {None}:
+            if t not in cache:
+                cache[t] = get_quote(t)
+        q = cache.get(c["ticker"])
+        if not q:
+            continue
+        move = (q["price"] / c["price0"] - 1) * 100
+        if abs(move) < 0.05 and age_h < 72:       # markets were closed; wait for a real move
+            continue
+        correct = (move > 0) == (c["lean"] == "up")
+        excess, correct_mkt = "", ""
+        bq = cache.get(c.get("bench")) if c.get("bench") else None
+        if bq and c.get("bench0"):
+            excess = round(move - (bq["price"] / c["bench0"] - 1) * 100, 2)
+            correct_mkt = int((excess > 0) == (c["lean"] == "up"))
+        with open(SCORE_FILE, "a", newline="") as f:
+            csv.writer(f).writerow([c["ts"], c["ticker"], c["lean"], c["confidence"], c["horizon"], round(move, 2),
+                                    excess, int(correct), correct_mkt])
+        c["scored"] = True
+        changed = True
+    if changed:
+        write_json(CALLS_FILE, [c for c in log if not c.get("scored") or
+                                (now - datetime.fromisoformat(c["ts"])).days < 7])
+
+
+def scorecard_line():
+    try:
+        rows = list(csv.DictReader(open(SCORE_FILE)))
+    except OSError:
+        return ""
+    if not rows:
+        return "Scorecard: no AI call has been checked yet."
+    n, ok = len(rows), sum(int(r["correct"]) for r in rows)
+    out = f"Scorecard: {ok}/{n} calls right ({ok / n * 100:.0f}%, coin flip = 50%)"
+    mk = [r for r in rows if r.get("correct_vs_market") not in (None, "")]
+    if len(mk) >= 5:
+        out += f" | stocks vs market {sum(int(r['correct_vs_market']) for r in mk)}/{len(mk)}"
+    by = []
+    for lvl in ("high", "medium", "low"):
+        sub = [r for r in rows if r["confidence"] == lvl]
+        if sub:
+            by.append(f"{lvl} {sum(int(r['correct']) for r in sub)}/{len(sub)}")
+    if by:
+        out += " | " + ", ".join(by)
+    if n < 30:
+        out += f"\nToo few results to judge yet ({n}/30)."
+    else:
+        z = (ok - n / 2) / (n ** 0.5 / 2)
+        out += ("\nVerdict: better than chance so far." if z > 2 else
+                "\nVerdict: WORSE than chance - do not follow these calls." if z < -2 else
+                "\nVerdict: no better than a coin flip so far - do not trade on these calls.")
+    return out
+
+
+# ---------------------------------------------------------------- message
+ARROW = {"up": "▲ UP", "down": "▼ DOWN", "unclear": "? unclear"}
+
+
+def build_message(hits, analysis, quotes, start=0, last=True):
+    parts, quiet = [], 0
+    for i, h in enumerate(hits, start + 1):
+        it = analysis["items"].get(i) if analysis else None
+        if analysis and it and not it["market_moving"]:
+            quiet += 1
+            continue
+        block = f"{i}. {h['title']}\n{h['link']}"
+        if it and it["calls"]:
+            for c in it["calls"]:
+                q = quotes.get(c["ticker"])
+                last = ""
+                if q and q["chg"] is not None:
+                    last = f" | 1d {q['chg']:+.1f}%" + (f" 5d {q['chg5']:+.1f}%" if q.get("chg5") is not None else "")
+                pin = " | likely priced in" if c["priced_in"] == "yes" else ""
+                block += (f"\n   {c['ticker']} {ARROW[c['lean']]} ({c['confidence']}, {c['horizon']}){pin}{last}"
+                          f"\n   {c['why']}")
+        elif not it:
+            groups = h["group"].replace("_", " ")
+            may = h.get("names", []) + CANDIDATES.get(h["group"], [])
+            block += f"\n   (no AI answer) could affect: {', '.join(may[:5])} [{groups}]"
+        parts.append(block)
+    text = "\n\n".join(parts) if parts else "No market-moving headlines in this batch."
+    if start == 0 and AI_ERROR:
+        text = f"⚠ AI problem: {AI_ERROR[:380]}\n\n" + text
+    if quiet:
+        text += f"\n\n+{quiet} headline(s) judged not market-moving."
+    if last:
+        if analysis and analysis["overall"]:
+            text += f"\n\nOverall: {analysis['overall']}"
+        if not analysis and AI_ERROR:
+            text += f"\n\nAI error: {AI_ERROR}"
+        text += f"\n\n{scorecard_line()}\nAI guess from headlines only, not advice. Check the price before acting."
+    return text[:3900]
+
+
+def send(title, message):
+    try:
+        requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=message.encode("utf-8"),
+                      headers={"Title": title.encode("utf-8"), "Priority": "high", "Tags": "chart_with_upwards_trend"},
+                      timeout=10)
+    except requests.RequestException as e:
+        print(f"Failed to send notification: {e}")
+
+
+# ---------------------------------------------------------------- main
+def main():
+    ensure_files()
+    seen = set(read_json(SEEN_FILE, []))
+    new_seen = set(seen)
+    hits, hit_links = [], set()
+    for url in FEEDS:
+        try:
+            parsed = feedparser.parse(url)
+        except Exception as e:
+            print(f"Failed to parse {url}: {e}")
+            continue
+        for e in parsed.entries[:30]:
+            link = e.get("link", "")
+            if not link or link in seen:
+                continue
+            title, summary = clean(e.get("title", "")), clean(e.get("summary", ""))
+            text = f"{title} {summary}"
+            group = next((g for g, d in KEYWORD_GROUPS.items() if matches(text, d)), None)
+            names = tickers_in(title)                 # company named in the headline itself
+            if names and not group:
+                group = "company"
+            if group:
+                if link not in hit_links:
+                    hits.append(dict(title=title, summary=summary, link=link, group=group, names=names))
+                    hit_links.add(link)
+            else:
+                new_seen.add(link)
+
+    score_old_calls()
+
+    batch = hits[:MAX_HEADLINES]
+    for h in hits[MAX_HEADLINES * 3:]:           # too many to ever catch up on: skip the oldest overflow
+        new_seen.add(h["link"])
+    if batch:
+        cands = []
+        for h in batch:
+            for t in h.get("names", []) + CANDIDATES.get(h["group"], []):
+                if t not in cands:
+                    cands.append(t)
+        cands.append("SPY")
+        quotes = fetch_quotes(cands)
+        analysis = ask_ai(batch, quotes)
+        if analysis:
+            extra = [c["ticker"] for it in analysis["items"].values() for c in it["calls"]]
+            quotes = fetch_quotes(extra, quotes)
+            log_calls(batch, analysis, quotes)
+        for k in range(0, len(batch), PER_MESSAGE):
+            part = batch[k:k + PER_MESSAGE]
+            last = k + PER_MESSAGE >= len(batch)
+            send(f"Market digest {k // PER_MESSAGE + 1}/{(len(batch) - 1) // PER_MESSAGE + 1}",
+                 build_message(part, analysis, quotes, start=k, last=last))
+        print(f"Sent digest with {len(batch)} headlines (AI: {'yes' if analysis else 'no'})")
+        for h in batch:
+            new_seen.add(h["link"])
+    write_json(SEEN_FILE, list(new_seen)[-800:])
+
+
+if __name__ == "__main__":
+    main()
